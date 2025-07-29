@@ -1,0 +1,138 @@
+name: Terraform Backend Setup & Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  plan:
+    name: Create S3 Backend + Terraform Plan
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+      BUCKET_NAME: "terraform-state-pratyushaa94"
+
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create Backend S3 Bucket if not exists
+        run: |
+          if ! aws s3api head-bucket --bucket $BUCKET_NAME 2>/dev/null; then
+            echo "Creating backend S3 bucket..."
+            aws s3api create-bucket --bucket $BUCKET_NAME --region $AWS_DEFAULT_REGION
+            aws s3api put-bucket-versioning \
+              --bucket $BUCKET_NAME \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption \
+              --bucket $BUCKET_NAME \
+              --server-side-encryption-configuration '{
+                "Rules": [
+                  {
+                    "ApplyServerSideEncryptionByDefault": {
+                      "SSEAlgorithm": "AES256"
+                    }
+                  }
+                ]
+              }'
+          else
+            echo "S3 bucket already exists."
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -var-file="environments/dev.tfvars" -out=tfplan
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2.1.0
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+ 
+      - name: Run Infracost Breakdown
+        run: |
+          infracost breakdown \
+          --path=plan.json \
+          --format=table \
+          --out-file=infracost-report.txt
+          
+      - name: Upload Infracost Report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-report
+          #path: infracost-report.json
+          path: infracost-report.txt
+ 
+      - name: Show Infracost report saved info
+        run: |
+          echo "INFO: Infracost cost breakdown report:"
+          cat infracost-report.txt
+          
+  apply:
+    name: Terraform Apply (Manual Approval)
+    runs-on: ubuntu-latest
+    needs: plan
+    environment:
+      name: dev-approval
+
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: .
+
+      - name: Terraform Apply
+        run: terraform apply tfplan
